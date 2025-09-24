@@ -1,0 +1,9 @@
+﻿services:
+  - type: web
+    name: voice-cr
+    env: python
+    region: frankfurt
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn "cr_ws:app" -k uvicorn.workers.UvicornWorker
+    plan: starter
+    autoDeploy: true
