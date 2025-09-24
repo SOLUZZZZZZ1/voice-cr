@@ -1,25 +1,20 @@
 ﻿# cr_ws.py — SpainRoom ConversationRelay WS (FastAPI)
-# Flujos:
-#  - Propietario / Inquilino: ciudad → nombre → teléfono → confirmación
-#  - Franquiciado (interesado): zona → nombre → teléfono → confirmación → envía lead a Admin
-#
-# Compatible con varios formatos de eventos CR (transcripciones en distintas claves).
-# Si el POST al backend falla, no rompe la llamada (best-effort).
+# Más tolerante con formatos de Twilio CR: procesa frames text/JSON, busca transcript profundo,
+# guía el flujo (propietario / inquilino / franquiciado) y evita bucles de "no le he entendido".
 
 import re
 import json
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
-# Ajusta si tu API tiene otro dominio:
 API_BASE = "https://backend-spainroom.onrender.com"
 
 app = FastAPI(title="SpainRoom Voice — CR WS")
 
-# ----------------------- Utils -----------------------
+# ----------------------- Utils robustos -----------------------
 
 def norm_text(s: str) -> str:
     return (s or "").strip().lower()
@@ -27,11 +22,10 @@ def norm_text(s: str) -> str:
 def extract_phone(s: str) -> Optional[str]:
     if not s: return None
     digits = re.sub(r"\D+", "", s)
-    # Acepta números largos + internacional, normaliza España
     if len(digits) >= 9:
         if digits.startswith("34") and len(digits) >= 11:
             return "+" + digits
-        if len(digits) == 9:  # típico móvil/ fijo sin prefijo
+        if len(digits) == 9:
             return "+34" + digits
         return "+" + digits
     return None
@@ -54,58 +48,77 @@ def role_from_text(s: str) -> Optional[str]:
         return "franquiciado"
     return None
 
+def _collect_strings(obj: Any, out: List[str], depth=0, max_depth=5):
+    if depth > max_depth:
+        return
+    if isinstance(obj, str):
+        t = obj.strip()
+        if t: out.append(t); return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _collect_strings(v, out, depth+1, max_depth)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_strings(v, out, depth+1, max_depth)
+
 def extract_transcript(payload: Any) -> Optional[str]:
     """
-    Intenta encontrar texto de usuario en varios formatos que usa Twilio CR o integraciones:
-    - {"input_transcript": "..."}
-    - {"speech": {"type": "transcript", "alternatives":[{"transcript": "..."}]}}
-    - {"text": "..."} o {"user": "..."} o {"utterance": "..."}
-    - {"input": {"text": "..."}}
-    - plain string
+    Estrategia:
+    1) Claves típicas directas
+    2) speech / asr con alternatives
+    3) claves genéricas (text, user, utterance, transcript)
+    4) input.text
+    5) búsqueda profunda: elegimos la STRING más larga (>= 3 chars)
     """
     if isinstance(payload, str):
         return payload.strip() or None
     if not isinstance(payload, dict):
         return None
 
+    # 1) directas
     t = payload.get("input_transcript")
-    if isinstance(t, str) and t.strip():
-        return t.strip()
+    if isinstance(t, str) and t.strip(): return t.strip()
 
-    speech = payload.get("speech") or payload.get("asr") or {}
-    if isinstance(speech, dict):
-        alts = speech.get("alternatives")
-        if isinstance(alts, list) and alts:
-            tt = alts[0].get("transcript") if isinstance(alts[0], dict) else None
-            if isinstance(tt, str) and tt.strip():
-                return tt.strip()
-        st = speech.get("text")
-        if isinstance(st, str) and st.strip():
-            return st.strip()
+    # 2) speech/asr con alternatives
+    for k in ("speech", "asr"):
+        block = payload.get(k) or {}
+        if isinstance(block, dict):
+            alts = block.get("alternatives")
+            if isinstance(alts, list) and alts:
+                tt = alts[0].get("transcript") if isinstance(alts[0], dict) else None
+                if isinstance(tt, str) and tt.strip(): return tt.strip()
+            st = block.get("text")
+            if isinstance(st, str) and st.strip(): return st.strip()
 
-    for k in ["text", "user", "utterance", "transcript"]:
+    # 3) genéricas
+    for k in ("text", "user", "utterance", "transcript"):
         v = payload.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+        if isinstance(v, str) and v.strip(): return v.strip()
 
+    # 4) input.text
     inp = payload.get("input")
     if isinstance(inp, dict):
         tx = inp.get("text")
-        if isinstance(tx, str) and tx.strip():
-            return tx.strip()
+        if isinstance(tx, str) and tx.strip(): return tx.strip()
+
+    # 5) búsqueda profunda de strings (elige la más larga razonable)
+    strings: List[str] = []
+    _collect_strings(payload, strings, 0, 5)
+    if strings:
+        # quedarse con la cadena más larga con letras
+        strings = [s for s in strings if re.search(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]", s)]
+        if strings:
+            strings.sort(key=lambda s: len(s), reverse=True)
+            best = strings[0].strip()
+            if len(best) >= 3:
+                return best
 
     return None
 
 async def say(ws: WebSocket, text: str, interruptible: bool = True):
-    await ws.send_json({
-        "type": "text",
-        "token": text,
-        "last": True,
-        "interruptible": interruptible
-    })
+    await ws.send_json({"type": "text", "token": text, "last": True, "interruptible": interruptible})
 
 def post_json(url: str, body: Dict[str, Any], timeout: float = 2.5) -> None:
-    """Best-effort POST; si falla no lanzamos excepción (no romper la llamada)."""
     try:
         req = urllib.request.Request(url,
                                      data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -125,34 +138,46 @@ async def health():
 async def cr_socket(ws: WebSocket):
     await ws.accept()
 
-    # Estado de la sesión
-    # step: role -> (prop/inq) -> city|zone -> name -> phone -> confirm
     session: Dict[str, Any] = {
-        "step": "role",
+        "step": "role",   # role -> city|zone -> name -> phone -> confirm -> done
         "data": {"role": "", "city": "", "zone": "", "name": "", "phone": ""},
+        "no_understood": 0,
     }
 
-    # Saludo inicial
     await say(ws, "Bienvenido a SpainRoom. ¿Es usted propietario, inquilino o franquiciado?")
 
     try:
         while True:
-            raw = await ws.receive_text()
+            # Recibir frame (texto o json)
             try:
-                payload = json.loads(raw)
+                raw = await ws.receive_text()
+                try:
+                    payload = json.loads(raw)
+                except Exception:
+                    payload = raw
             except Exception:
-                payload = raw
+                # si no es texto, intenta JSON directo
+                try:
+                    payload = await ws.receive_json()
+                except Exception:
+                    payload = None
 
-            user_text = extract_transcript(payload)
+            user_text = extract_transcript(payload) if payload is not None else None
+
             if not user_text:
-                await say(ws, "No le he entendido. ¿Podría repetirlo, por favor?")
+                session["no_understood"] += 1
+                if session["no_understood"] >= 2:
+                    await say(ws, "No le he entendido bien. Diga por favor: ‘propietario’, ‘inquilino’ o ‘franquiciado’.")
+                    session["no_understood"] = 0
+                else:
+                    await say(ws, "No le he entendido. ¿Podría repetirlo, por favor?")
                 continue
 
+            session["no_understood"] = 0
             txt = norm_text(user_text)
             step = session["step"]
             data = session["data"]
 
-            # 1) Descubrimos rol
             if step == "role":
                 r = role_from_text(txt)
                 if not r:
@@ -167,7 +192,6 @@ async def cr_socket(ws: WebSocket):
                     await say(ws, "De acuerdo. ¿En qué ciudad o población?")
                 continue
 
-            # 2) Ciudad o zona (según rol)
             if step == "city":
                 data["city"] = user_text.strip().title()
                 session["step"] = "name"
@@ -180,14 +204,12 @@ async def cr_socket(ws: WebSocket):
                 await say(ws, "Gracias. ¿Su nombre y apellidos?")
                 continue
 
-            # 3) Nombre
             if step == "name":
                 data["name"] = user_text.strip().title()
                 session["step"] = "phone"
                 await say(ws, "¿Me indica un teléfono de contacto?")
                 continue
 
-            # 4) Teléfono
             if step == "phone":
                 ph = extract_phone(user_text)
                 if not ph:
@@ -196,17 +218,13 @@ async def cr_socket(ws: WebSocket):
                 data["phone"] = ph
                 session["step"] = "confirm"
                 if data["role"] == "franquiciado":
-                    await say(ws,
-                        f"Entonces, {data['name']}, franquiciado interesado en {data['zone']}, teléfono {data['phone']}. ¿Es correcto?")
+                    await say(ws, f"Entonces, {data['name']}, interesado en franquicia en {data['zone']}, teléfono {data['phone']}. ¿Es correcto?")
                 else:
-                    await say(ws,
-                        f"Entonces, {data['name']}, {data['role']} en {data['city']}, teléfono {data['phone']}. ¿Es correcto?")
+                    await say(ws, f"Entonces, {data['name']}, {data['role']} en {data['city']}, teléfono {data['phone']}. ¿Es correcto?")
                 continue
 
-            # 5) Confirmación + envío de lead
             if step == "confirm":
                 if looks_yes(user_text):
-                    # Dispara lead a Admin según rol
                     role = data["role"]
                     if role == "franquiciado":
                         body = {
@@ -225,12 +243,11 @@ async def cr_socket(ws: WebSocket):
                             "poblacion": data["city"],
                             "via": "voice_web"
                         }
-                        # si tienes un endpoint /api/contacto/tenants o /api/contacto/owners cámbialo aquí:
+                        # Cambia a tus endpoints reales si los tienes separados
                         post_json(f"{API_BASE}/api/contacto", body)
                         await say(ws, "Perfecto. Un asesor de SpainRoom se pondrá en contacto con usted. ¡Gracias!")
                     session["step"] = "done"
                 elif looks_no(user_text):
-                    # Reiniciar
                     session["step"] = "role"
                     session["data"] = {"role": "", "city": "", "zone": "", "name": "", "phone": ""}
                     await say(ws, "De acuerdo, volvemos a empezar. ¿Es usted propietario, inquilino o franquiciado?")
@@ -238,16 +255,14 @@ async def cr_socket(ws: WebSocket):
                     await say(ws, "¿Podría confirmar si es correcto, sí o no?")
                 continue
 
-            # 6) Fin o eco amable
             if session["step"] == "done":
                 await say(ws, "¿Desea algo más?")
             else:
                 await say(ws, f"Ha dicho: {user_text}. ¿Podría repetirlo o dar más detalles?")
+
     except WebSocketDisconnect:
-        # usuario colgó o Twilio cortó
         pass
     except Exception:
-        # fallo general (silenciado para que Twilio reintente)
         pass
     finally:
         try:
