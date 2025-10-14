@@ -1,8 +1,28 @@
-Flask==3.1.2
-Flask-Cors==6.0.1
-gunicorn==23.0.0
+# Core
+Flask==3.0.3
+Flask-SQLAlchemy==3.1.1
+Flask-Cors==4.0.1
+
+# Base de datos
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.30
+
+# Utilidades
+python-dotenv==1.0.1
+
+# WSGI server
+gunicorn==22.0.0
+
+# Pagos (Stripe)
 stripe==7.14.0
+
+# Seguridad / defensa
+flask-limiter==3.7.0
+PyJWT==2.10.1
+
+# Bot de voz
+twilio==9.2.3
 starlette==0.36.3
 uvicorn==0.30.6
-
+gunicorn==23.0.0
 
